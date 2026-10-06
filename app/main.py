@@ -9,8 +9,12 @@
 的组保持可放行。隔离与确认都走同一写路径（写锁 + BEGIN IMMEDIATE），并发时
 以提交先后决定是拒绝候选还是阻断新组。
 
-每个请求使用各自线程的 SQLite 连接：查询只能看到已提交的完整快照，
-确认/隔离事务未提交的中间状态对其他请求不可见。
+每个请求使用各自线程的 SQLite 连接：确认/隔离事务未提交的中间状态对其他请求
+不可见。所有**读响应**（电芯列表/详情、录入与复测后的回读、预选、组详情）都在
+单个只读事务（read_snapshot）内完成，使一次响应里每节电芯的占用、组编号与隔离
+标志来自同一个已提交快照——确认与隔离接连提交时，响应要么整体停留在确认前、
+要么整体进入确认后或隔离后，不会拼出 occupied=false 且 isolated=true 这类
+从未提交过的混合状态。
 """
 from datetime import datetime, timezone
 
@@ -75,25 +79,31 @@ def create_cell(body: CellCreate):
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)).fetchone()
-    return _row_to_cell(conn, row)
+    # 回读与隔离标记须取自同一已提交快照，避免与并发确认/隔离交错拼出混合状态
+    with db.read_snapshot(conn):
+        row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)).fetchone()
+        return _row_to_cell(conn, row)
 
 
 @app.get("/cells")
 def list_cells():
-    """电芯列表：只反映已提交的占用与隔离状态。"""
+    """电芯列表：每节电芯的占用、组编号与隔离标志取自同一个已提交快照。"""
     conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
-    return {"count": len(rows), "cells": [_row_to_cell(conn, r) for r in rows]}
+    with db.read_snapshot(conn):
+        rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
+        cells = [_row_to_cell(conn, r) for r in rows]
+    return {"count": len(cells), "cells": cells}
 
 
 @app.get("/cells/{cell_id}")
 def get_cell(cell_id: str):
+    """单节电芯：占用、组编号与隔离标志取自同一个已提交快照。"""
     conn = db.get_conn()
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, f"电芯 {cell_id} 不存在")
-    return _row_to_cell(conn, row)
+    with db.read_snapshot(conn):
+        row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, f"电芯 {cell_id} 不存在")
+        return _row_to_cell(conn, row)
 
 
 @app.put("/cells/{cell_id}/test")
@@ -119,8 +129,10 @@ def revise_test(cell_id: str, body: TestRevision):
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    return _row_to_cell(conn, row)
+    # 复测后的回读同样按同一快照口径返回占用、组编号与隔离标志
+    with db.read_snapshot(conn):
+        row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+        return _row_to_cell(conn, row)
 
 
 # ---------- 安全隔离 ----------
@@ -177,14 +189,16 @@ def list_isolations():
 def preselect(body: PreselectRequest):
     """按串联要求预选一组同体系、未占用、未隔离电芯（只读，不占用）。
 
-    只统计已提交的占用与隔离状态：确认/隔离事务未提交的中间状态不可见。
+    只统计已提交的占用与隔离状态：确认/隔离事务未提交的中间状态不可见；
+    占用筛选与隔离排除在同一已提交快照内完成，不会选中半提交状态的电芯。
     """
     conn = db.get_conn()
-    rows = conn.execute(
-        "SELECT * FROM cells WHERE occupied = 0"
-        " AND cell_id NOT IN (SELECT cell_id FROM isolations)"
-    ).fetchall()
-    free = [_row_to_cell(conn, r) for r in rows]
+    with db.read_snapshot(conn):
+        rows = conn.execute(
+            "SELECT * FROM cells WHERE occupied = 0"
+            " AND cell_id NOT IN (SELECT cell_id FROM isolations)"
+        ).fetchall()
+        free = [_row_to_cell(conn, r) for r in rows]
     if body.chemistry is not None:
         free = [c for c in free if c["chemistry"] == body.chemistry]
 
@@ -326,7 +340,9 @@ def confirm_group(body: ConfirmRequest):
         except Exception:
             conn.rollback()  # 整组拒绝：不留下任何部分占用
             raise
-    return _group_payload(conn, group_id)
+    # 组快照与阻断信息须取自同一已提交快照（并发隔离不会拼出半阻断状态）
+    with db.read_snapshot(conn):
+        return _group_payload(conn, group_id)
 
 
 def _group_payload(conn, group_id: int) -> dict:
@@ -379,9 +395,13 @@ def list_groups():
 
 @app.get("/groups/{group_id}")
 def get_group(group_id: int):
-    """按组编号查询不可改写的检测快照与当前阻断状态（未提交或已回滚的组不可见）。"""
+    """按组编号查询不可改写的检测快照与当前阻断状态（未提交或已回滚的组不可见）。
+
+    组存在性、检测快照与阻断电芯在同一个已提交快照内读取。
+    """
     conn = db.get_conn()
-    g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
-    if g is None:
-        raise HTTPException(404, f"组 {group_id} 不存在")
-    return _group_payload(conn, group_id)
+    with db.read_snapshot(conn):
+        g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
+        if g is None:
+            raise HTTPException(404, f"组 {group_id} 不存在")
+        return _group_payload(conn, group_id)

@@ -53,8 +53,13 @@ python -m pytest tests/ -q
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
   成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
-  隔离与确认同时发生时，以**提交先后**决定是拒绝候选（隔离先提交）还是阻断新组
-  （确认先提交），查询不会显示半成品。并发查询不会阻塞、也不会干扰写事务。
+  每一次查询响应（电芯列表/详情、录入与复测回读、预选、组快照）都包在**同一只读
+  事务**中：单节电芯的占用、组编号、隔离标志以及组的阻断结果取自同一已提交快照。
+  因此即使「读取已拿到确认前的占用、确认随后提交、隔离再随后提交」，该次响应也
+  只能整体停留在确认前、确认后或隔离后三种完整状态之一，绝不会拼出
+  `occupied=false, isolated=true` 这类从未提交过的状态。隔离与确认同时发生时，以
+  **提交先后**决定是拒绝候选（隔离先提交）还是阻断新组（确认先提交），查询不会
+  显示半成品。并发查询不会阻塞、也不会干扰写事务。
 
 ## API 一览
 
@@ -247,18 +252,96 @@ wait
   该组；若确认失败回滚，该组始终不可见。
 - `/cells` 与 `/preselect` 在确认提交前看不到临时占用；提交成功后整组占用
   一次性可见。
+- **同一次响应内部一致**：`/cells`、`/cells/{id}`、录入与复测的回读、`/preselect`
+  与组详情都在同一只读事务内完成。若一个读取已经按确认前快照开始，随后「确认
+  提交 → 隔离提交」接连发生，该次响应仍整体保持确认前状态；绝不会出现
+  `occupied=false` 而 `isolated=true`（或 `group_id` 与占用不匹配）的混合行。
+  下一次读取则整体进入隔离后的完整状态（`occupied=true, group_id=1, isolated=true`）。
 - 隔离与确认并发时，以**提交先后**决定结果：隔离先提交则确认整组拒绝（无组、
   无占用）；确认先提交则新组产生并随即显示为已阻断。任何时刻查询都不会看到
   半成品状态。
 - 读取与确认并发执行互不影响：读取永远拿到一致的已提交状态，确认事务照常
   原子提交或整组回滚。
 
+### 8. 可控读写交错核对（确认 → 隔离之间不得拼出混合状态）
+
+针对「读取先拿到确认前占用、窗口内确认提交、隔离再提交」这一最危险顺序，可用
+两个终端做一次可控核对。
+
+终端 A：持续轮询电芯列表与 C001 档案，一旦出现从未提交过的混合状态就报错：
+
+```bash
+while true; do
+  curl -s http://localhost:8000/cells \
+    | python3 -c '
+import json, sys
+for c in json.load(sys.stdin)["cells"]:
+    occ, gid, iso = c["occupied"], c["group_id"], c["isolated"]
+    assert (gid is not None) == occ, c            # 占用与组编号必须一致
+    assert not (iso and not occ), c               # 不得出现 occupied=false 且 isolated=true
+' || { echo "!! /cells 拼出了混合状态"; exit 1; }
+  curl -s http://localhost:8000/cells/C001 \
+    | python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+assert (c["group_id"] is not None) == c["occupied"], c
+assert not (c["isolated"] and not c["occupied"]), c
+' || { echo "!! /cells/C001 拼出了混合状态"; exit 1; }
+done
+```
+
+终端 B：在 6 节在库电芯上确认含 C001 的组，紧接其后隔离 C001（两个提交落在
+轮询读取的窗口内）：
+
+```bash
+curl -s -X POST http://localhost:8000/groups/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"cells":[
+        {"cell_id":"C001","test_version":"T1"},
+        {"cell_id":"C002","test_version":"T1"},
+        {"cell_id":"C003","test_version":"T1"},
+        {"cell_id":"C004","test_version":"T1"}]}'
+echo
+
+curl -s -X POST http://localhost:8000/cells/C001/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"确认后抽检不合格"}'
+echo
+```
+
+核对结论：
+
+- 终端 A 全程不报错——每次响应要么整体是确认前
+  （`occupied=false, group_id=null, isolated=false`），要么直接整体进入隔离后
+  （`occupied=true, group_id=1, isolated=true`），不会出现中间拼出的
+  `occupied=false, isolated=true`。
+- 隔离提交后的单次查询显示完整隔离后状态：
+
+```bash
+curl -s http://localhost:8000/cells/C001
+# {"cell_id":"C001","chemistry":"LFP","capacity":100.0,"resistance":2.1,
+#  "test_version":"T1","occupied":true,"group_id":1,"isolated":true}
+```
+
+- 预选始终只按**已提交**的占用与隔离状态筛选：上述两笔提交完成后再次预选，
+  C001~C004 整组不再作为候选；确认事务仍会重查版本/占用/隔离，过期候选照旧
+  返回 `409` 整组拒绝。
+
+仓库内的确定性测试把这个交错顺序固定了下来（在读取已取得确认前快照、尚未读取
+隔离标志处阻塞，期间完成确认与隔离两次提交）：
+
+```bash
+python -m pytest tests/ -q -k "one_snapshot or mixed_state"
+# 修复前：GET /cells、GET /cells/{id}、录入与复测回读均会拼出
+#        occupied=false, isolated=true（测试失败）；
+# 修复后：全部通过，响应整体停留在确认前快照。
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询
-  db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询（读响应统一走 read_snapshot）
+  db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁、只读快照事务
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
   schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因等校验）
 tests/test_api.py

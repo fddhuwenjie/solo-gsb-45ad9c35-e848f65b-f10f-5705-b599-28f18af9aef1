@@ -538,3 +538,227 @@ def test_isolation_and_confirm_race_commit_order_decides(client):
         assert results["confirm"] == 409
         assert groups == []
         assert all(not c["occupied"] for c in client.get("/cells").json()["cells"])
+
+
+# ---------- 单次查询的快照一致性（可控读写交错） ----------
+
+def _install_row_hook(monkeypatch, target_cell):
+    """在 _row_to_cell 读取 target_cell 的隔离标志前插入一个可控阻塞点。
+
+    阻塞点位于 cells 行已取出、isolations 查询尚未发出之间：
+    修复前两条 SELECT 各取最新快照，窗口内的提交会被后半段读到而拼出混合状态；
+    修复后整个响应包在同一只读事务中，快照在 cells 查询时即固定，窗口内提交不可见。
+    返回 (started, proceed)：阻塞开始时 set(started)，等待 set(proceed) 后继续。
+    """
+    from app import main
+    started = threading.Event()
+    proceed = threading.Event()
+    orig = main._row_to_cell
+
+    def patched(conn, row):
+        if row["cell_id"] == target_cell and not patched.fired:
+            patched.fired = True
+            started.set()
+            assert proceed.wait(10), "交错窗口等待超时"
+        return orig(conn, row)
+    patched.fired = False
+    monkeypatch.setattr(main, "_row_to_cell", patched)
+    return started, proceed
+
+
+def _assert_cell_coherent(cell):
+    """电芯档案三态不变量：占用/组编号/隔离不得跨快照拼接。"""
+    if cell["occupied"]:
+        assert cell["group_id"] is not None, f"已占用却无组编号：{cell}"
+    else:
+        assert cell["group_id"] is None, f"未占用却带组编号：{cell}"
+    # 从未提交过的状态：未占用（确认前）不可能同时已隔离（隔离在确认之后）
+    assert not (not cell["occupied"] and cell["isolated"]), (
+        f"拼出不存在的状态 occupied=false, isolated=true：{cell}")
+
+
+def test_list_cells_reads_one_snapshot_across_confirm_then_isolate(client, monkeypatch):
+    """GET /cells 交错窗口：先读确认前的 cells，窗口内确认+隔离先后提交。
+
+    响应必须整体停留在确认前快照；修复前会返回 C001 occupied=false, isolated=true。
+    """
+    seed_six(client)
+    started, proceed = _install_row_hook(monkeypatch, "C001")
+    from app.main import app
+
+    result = {}
+
+    def do_list():
+        with TestClient(app) as c:
+            r = c.get("/cells")
+            result["status"] = r.status_code
+            result["cells"] = {c["cell_id"]: c for c in r.json()["cells"]}
+
+    t = threading.Thread(target=do_list)
+    t.start()
+    assert started.wait(10)
+
+    # cells 已读、C001 隔离标志未读的窗口内：确认含 C001 的组并提交，再隔离 C001 并提交
+    assert _confirm(client, ["C001", "C002", "C003", "C004"]).status_code == 201
+    assert isolate(client, "C001", "交错窗口隔离").status_code == 201
+    proceed.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    assert result["status"] == 200
+    snapshot = result["cells"]
+    # 整体为确认前快照：4 节候选全部未占用、无组、未隔离
+    for cid in ("C001", "C002", "C003", "C004"):
+        c = snapshot[cid]
+        _assert_cell_coherent(c)
+        assert (c["occupied"], c["group_id"], c["isolated"]) == (False, None, False)
+
+    # 窗口关闭后再查：完整进入隔离后状态（已占用 + 有组 + 已隔离，整组一致）
+    after = {c["cell_id"]: c for c in client.get("/cells").json()["cells"]}
+    _assert_cell_coherent(after["C001"])
+    assert (after["C001"]["occupied"], after["C001"]["group_id"],
+            after["C001"]["isolated"]) == (True, 1, True)
+    for cid in ("C002", "C003", "C004"):
+        assert (after[cid]["occupied"], after[cid]["group_id"],
+                after[cid]["isolated"]) == (True, 1, False)
+
+
+def test_get_cell_reads_one_snapshot_across_confirm_then_isolate(client, monkeypatch):
+    """GET /cells/C001 同一交错窗口：占用、组编号与隔离标志须同属确认前快照。"""
+    seed_six(client)
+    started, proceed = _install_row_hook(monkeypatch, "C001")
+    from app.main import app
+
+    result = {}
+
+    def do_get():
+        with TestClient(app) as c:
+            r = c.get("/cells/C001")
+            result["status"] = r.status_code
+            result["cell"] = r.json()
+
+    t = threading.Thread(target=do_get)
+    t.start()
+    assert started.wait(10)
+
+    assert _confirm(client, ["C001", "C002", "C003", "C004"]).status_code == 201
+    assert isolate(client, "C001", "交错窗口隔离").status_code == 201
+    proceed.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    assert result["status"] == 200
+    _assert_cell_coherent(result["cell"])
+    assert (result["cell"]["occupied"], result["cell"]["group_id"],
+            result["cell"]["isolated"]) == (False, None, False)
+
+    after = client.get("/cells/C001").json()
+    _assert_cell_coherent(after)
+    assert (after["occupied"], after["group_id"], after["isolated"]) == (True, 1, True)
+
+
+def test_retest_response_reads_one_snapshot_in_race_window(client, monkeypatch):
+    """复测入口的电芯响应复用同一口径：回读窗口内确认+隔离提交，不拼混合状态。"""
+    seed_six(client)
+    started, proceed = _install_row_hook(monkeypatch, "C001")
+    from app.main import app
+
+    result = {}
+
+    def do_retest():
+        with TestClient(app) as c:
+            r = c.put("/cells/C001/test", json={
+                "capacity": 100.0, "resistance": 2.0, "test_version": "T2"})
+            result["status"] = r.status_code
+            result["cell"] = r.json()
+
+    t = threading.Thread(target=do_retest)
+    t.start()
+    assert started.wait(10)
+
+    # 复测已提交（T2）、响应隔离标志未读：用新版本确认含 C001 的组，再隔离 C001
+    r = client.post("/groups/confirm", json={"cells": [
+        {"cell_id": "C001", "test_version": "T2"},
+        {"cell_id": "C002", "test_version": "T1"},
+        {"cell_id": "C003", "test_version": "T1"},
+        {"cell_id": "C004", "test_version": "T1"}]})
+    assert r.status_code == 201, r.text
+    assert isolate(client, "C001", "复测回读窗口隔离").status_code == 201
+    proceed.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    assert result["status"] == 200
+    cell = result["cell"]
+    assert cell["test_version"] == "T2"
+    _assert_cell_coherent(cell)
+    # 响应固定在复测提交后、确认前的快照：未占用、无组、未隔离
+    assert (cell["occupied"], cell["group_id"], cell["isolated"]) == (False, None, False)
+
+
+def test_create_response_reads_one_snapshot_in_race_window(client, monkeypatch):
+    """录入入口的电芯响应复用同一口径：回读窗口内确认+隔离提交，不拼混合状态。"""
+    seed_six(client)  # 6 节在库，仍可继续录入
+    started, proceed = _install_row_hook(monkeypatch, "C007")
+    from app.main import app
+
+    result = {}
+
+    def do_create():
+        with TestClient(app) as c:
+            r = c.post("/cells", json={
+                "cell_id": "C007", "chemistry": "LFP", "capacity": 96.0,
+                "resistance": 2.45, "test_version": "T1"})
+            result["status"] = r.status_code
+            result["cell"] = r.json()
+
+    t = threading.Thread(target=do_create)
+    t.start()
+    assert started.wait(10)
+
+    # C007 插入已提交、响应隔离标志未读：确认含 C007 的 3 节组（约束满足），再隔离
+    assert _confirm(client, ["C007", "C005", "C006"]).status_code == 201
+    assert isolate(client, "C007", "录入回读窗口隔离").status_code == 201
+    proceed.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    assert result["status"] == 201
+    cell = result["cell"]
+    _assert_cell_coherent(cell)
+    assert (cell["occupied"], cell["group_id"], cell["isolated"]) == (False, None, False)
+
+    after = client.get("/cells/C007").json()
+    _assert_cell_coherent(after)
+    assert (after["occupied"], after["group_id"], after["isolated"]) == (True, 1, True)
+
+
+def test_concurrent_cell_reads_never_show_mixed_state(client):
+    """随机并发：确认与隔离接连提交期间轮询电芯档案，任何响应都不得出现混合状态。"""
+    seed_six(client)
+    from app.main import app
+    broken = []
+
+    def reader():
+        with TestClient(app) as c:
+            for _ in range(50):
+                body = c.get("/cells").json()
+                for cell in body["cells"]:
+                    try:
+                        _assert_cell_coherent(cell)
+                    except AssertionError:
+                        broken.append(cell)
+                one = c.get("/cells/C001")
+                if one.status_code == 200:
+                    try:
+                        _assert_cell_coherent(one.json())
+                    except AssertionError:
+                        broken.append(one.json())
+
+    rthread = threading.Thread(target=reader)
+    rthread.start()
+    assert _confirm(client, ["C001", "C002", "C003", "C004"]).status_code == 201
+    assert isolate(client, "C001", "并发轮询隔离").status_code == 201
+    rthread.join(10)
+    assert not rthread.is_alive()
+    assert not broken
