@@ -53,8 +53,16 @@ python -m pytest tests/ -q
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
   成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
-  隔离与确认同时发生时，以**提交先后**决定是拒绝候选（隔离先提交）还是阻断新组
-  （确认先提交），查询不会显示半成品。并发查询不会阻塞、也不会干扰写事务。
+  **单次查询内各电芯的占用、组编号与隔离标志取自同一已提交快照**：`GET /cells`、
+  `GET /cells/{id}`（以及录入、复测返回电芯档案的响应）都在一个只读事务内完成、
+  或以一条 `LEFT JOIN` 同时读取 `cells` 与 `isolations`，因此在"读请求先读到
+  占用信息 → 另一请求确认含该电芯的组并提交、再隔离该电芯并提交 → 读请求随后才读
+  隔离信息"这种交错下，只可能返回**确认前**（`occupied=false, group_id=null,
+  isolated=false`）或**确认/隔离后**（`occupied=true, group_id=<组号>,
+  isolated=true`）的完整状态，绝不会拼出 `occupied=false` 同时 `isolated=true`
+  这种不存在的混合状态；未提交修改始终不可见。隔离与确认同时发生时，以**提交先后**
+  决定是拒绝候选（隔离先提交）还是阻断新组（确认先提交），查询不会显示半成品。
+  并发查询不会阻塞、也不会干扰写事务。
 
 ## API 一览
 
@@ -252,6 +260,52 @@ wait
   半成品状态。
 - 读取与确认并发执行互不影响：读取永远拿到一致的已提交状态，确认事务照常
   原子提交或整组回滚。
+
+### 8. 同一快照口径：确认与隔离交错时不拼出不存在的状态
+
+考虑这个交错：一次 `GET /cells`（或 `GET /cells/C001`）先读到 C001 的占用信息，
+此时另一请求**确认**含 C001 的组并提交、随后又**隔离** C001 并提交，读请求最后
+才去读隔离信息。由于占用、组编号与隔离标志在**同一个只读事务（同一已提交快照）**
+内读取，返回只可能是确认前或确认/隔离后的**完整状态**，不会出现
+`occupied=false` 却 `isolated=true` 的矛盾记录：
+
+```bash
+# 终端 A：持续轮询电芯列表 / 单芯档案
+( while true; do
+    curl -s http://localhost:8000/cells        | python3 -m json.tool
+    curl -s http://localhost:8000/cells/C001   | python3 -m json.tool
+  done ) &
+POLL=$!
+
+# 终端 B：先确认整组，提交后再隔离 C001（两次独立提交）
+curl -s -X POST http://localhost:8000/groups/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"cells":[
+        {"cell_id":"C001","test_version":"T1"},
+        {"cell_id":"C002","test_version":"T1"},
+        {"cell_id":"C003","test_version":"T1"},
+        {"cell_id":"C004","test_version":"T1"}]}'
+curl -s -X POST http://localhost:8000/cells/C001/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"抽检发现漏液"}'
+
+kill $POLL
+```
+
+任何一次返回里，C001 只会是下面两种**自洽**状态之一：
+
+```jsonc
+// 确认前快照
+{"cell_id":"C001","occupied":false,"group_id":null,"isolated":false}
+// 确认 + 隔离提交后的快照
+{"cell_id":"C001","occupied":true,"group_id":1,"isolated":true}
+```
+
+绝不会出现 `{"occupied":false,"group_id":null,"isolated":true}` 这种跨快照拼出的
+不存在状态。录入（`POST /cells`）与复测（`PUT /cells/{id}/test`）返回电芯档案时
+遵守同一口径；`/preselect` 也在同一快照内按已提交的占用与隔离状态筛选。需要严格
+复现该交错时，测试用 SQLite 的 `set_progress_handler` 在"读到占用之后、读隔离
+之前"可控挂起读线程，再依次提交确认与隔离（见 `tests/test_api.py` 中
+`*_reads_one_committed_snapshot`）。
 
 ## 项目结构
 

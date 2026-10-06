@@ -538,3 +538,223 @@ def test_isolation_and_confirm_race_commit_order_decides(client):
         assert results["confirm"] == 409
         assert groups == []
         assert all(not c["occupied"] for c in client.get("/cells").json()["cells"])
+
+
+# ---------- 可控读写交错：单次查询内不允许跨快照拼装状态 ----------
+#
+# 交错顺序：读请求先读到 C001 的占用信息（occupied=0），此刻挂起；
+# 写方先提交"确认"（C001 占用 + 组编号），再提交"隔离" C001；
+# 随后读请求才去读隔离信息。
+#
+# 正确实现下两条 SELECT 共享同一个已提交快照，只可能得到：
+#   确认前：occupied=false, group_id=null, isolated=false
+#   确认后/隔离后：occupied=true, group_id=<gid>, isolated=true
+# 绝不能拼出 occupied=false + isolated=true 这种不存在的状态。
+
+
+def _install_reader_gate(conn, gate, occurrence=1):
+    """在连接上装一个一次性闸门：第 occurrence 次读取 cells 行时，在该语句
+    已建立读快照、尚未返回前挂起，直到 gate['release'] 被置位；进入挂起前
+    置位 gate['inside']。
+
+    用 "FROM cells" 作标记（旧实现的 `SELECT * FROM cells ...` 与新实现的
+    `... FROM cells c LEFT JOIN isolations ...` 都命中），但排除录入事务里的
+    `SELECT COUNT(*) ... FROM cells`；occurrence 用于录入/复测（写事务内的
+    查询不计入或计入后，只挂提交后构建响应的那一次）。
+    """
+    seen = {"n": 0, "should_block": False, "blocked": False}
+
+    def trace(statement):
+        compact = statement.upper()
+        if "FROM CELLS" in compact and "COUNT(" not in compact:
+            seen["n"] += 1
+            if seen["n"] == occurrence:
+                seen["should_block"] = True
+
+    def progress():
+        if seen["should_block"] and not seen["blocked"]:
+            seen["blocked"] = True
+            seen["should_block"] = False
+            gate["inside"].set()
+            gate["release"].wait(5)
+        return 0
+
+    conn.set_trace_callback(trace)
+    conn.set_progress_handler(progress, 1)
+
+
+def _commit_confirm_then_isolate(path, target="C001", group_id=1):
+    """写方线程：在独立连接上先提交整组确认的占用效果（occupied + 组编号），
+    再提交对 target 的隔离。复现"先确认后隔离"两次提交在同一读请求窗口内落库。"""
+    import sqlite3
+    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "UPDATE cells SET occupied = 1, group_id = ? WHERE cell_id = ?",
+        (group_id, target))
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO isolations (cell_id, reason, created_at)"
+        " VALUES (?, ?, '2026-10-06T00:00:00+00:00')", (target, "并发交错隔离"))
+    conn.commit()
+    conn.close()
+
+
+def _assert_coherent_cell(cell, gid=1):
+    """一节电芯的占用、组编号、隔离标志必须来自同一已提交快照。"""
+    if cell["occupied"]:
+        # 确认后（可能也是隔离后）
+        assert cell["group_id"] == gid
+    else:
+        # 确认前：必无组编号，也不可能已隔离（隔离发生在确认提交之后）
+        assert cell["group_id"] is None
+        assert cell["isolated"] is False
+
+
+def test_list_cells_reads_one_committed_snapshot(client):
+    """GET /cells：占用、组编号与隔离标志取自同一已提交快照，不跨快照拼装。"""
+    seed_six(client)
+    from app import db
+    from app.main import list_cells
+    path = os.environ["DB_PATH"]
+
+    gate = {"inside": threading.Event(), "release": threading.Event()}
+    outcome = {}
+
+    def reader():
+        conn = db.get_conn()  # 在本线程内取连接，闸门装在读请求专用连接上
+        _install_reader_gate(conn, gate, occurrence=1)
+        try:
+            outcome["body"] = list_cells()
+        finally:
+            conn.set_trace_callback(None)
+            conn.set_progress_handler(None, 0)
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+    assert gate["inside"].wait(5)
+    _commit_confirm_then_isolate(path)
+    gate["release"].set()
+    rt.join(5)
+    assert not rt.is_alive()
+
+    cells = {c["cell_id"]: c for c in outcome["body"]["cells"]}
+    _assert_coherent_cell(cells["C001"])
+    # 未被交错影响的电芯保持确认前状态
+    for cid in ("C002", "C003", "C004", "C005", "C006"):
+        assert cells[cid]["occupied"] is False
+        assert cells[cid]["group_id"] is None
+        assert cells[cid]["isolated"] is False
+
+
+def test_get_cell_reads_one_committed_snapshot(client):
+    """GET /cells/{cell_id}：同样不允许跨快照拼出 occupied=false, isolated=true。"""
+    seed_six(client)
+    from app import db
+    from app.main import get_cell
+    path = os.environ["DB_PATH"]
+
+    gate = {"inside": threading.Event(), "release": threading.Event()}
+    outcome = {}
+
+    def reader():
+        conn = db.get_conn()
+        _install_reader_gate(conn, gate, occurrence=1)
+        try:
+            outcome["cell"] = get_cell("C001")
+        finally:
+            conn.set_trace_callback(None)
+            conn.set_progress_handler(None, 0)
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+    assert gate["inside"].wait(5)
+    _commit_confirm_then_isolate(path)
+    gate["release"].set()
+    rt.join(5)
+    assert not rt.is_alive()
+
+    _assert_coherent_cell(outcome["cell"])
+
+
+def test_create_cell_response_reads_one_committed_snapshot(client):
+    """录入响应复用电芯口径：返回档案的占用与隔离状态也必须同快照。
+
+    交错：写入新电芯 C007 提交后构建响应时，先读到 C007 占用信息再挂起；
+    写方并发确认 C007 并隔离 C007。返回只可能是确认前
+    （occupied=false, group_id=null, isolated=false）或确认/隔离后
+    （occupied=true, group_id=1, isolated=true）的完整状态。
+    """
+    seed_six(client)
+    from app import db
+    from app.main import create_cell
+    from app.schemas import CellCreate
+    path = os.environ["DB_PATH"]
+
+    gate = {"inside": threading.Event(), "release": threading.Event()}
+    outcome = {}
+
+    def reader():
+        conn = db.get_conn()
+        # 录入事务内的 SELECT COUNT(*) 被排除，提交后构建响应的行读取是第 1 次
+        _install_reader_gate(conn, gate, occurrence=1)
+        try:
+            outcome["cell"] = create_cell(CellCreate(
+                cell_id="C007", chemistry="LFP", capacity=95.0,
+                resistance=2.6, test_version="T1"))
+        finally:
+            conn.set_trace_callback(None)
+            conn.set_progress_handler(None, 0)
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+    assert gate["inside"].wait(5)
+    _commit_confirm_then_isolate(path, target="C007")
+    gate["release"].set()
+    rt.join(5)
+    assert not rt.is_alive()
+
+    cell = outcome["cell"]
+    assert cell["cell_id"] == "C007"
+    _assert_coherent_cell(cell)
+
+
+def test_revise_test_response_reads_one_committed_snapshot(client):
+    """复测响应复用电芯口径：返回档案的占用与隔离状态也必须同快照。
+
+    交错：复测 C001 提交后读取档案，先读到占用信息（复测不改占用）再挂起；
+    写方提交确认 C001 并隔离 C001。返回只可能是确认前或确认后的完整状态。
+    """
+    seed_six(client)
+    from app import db
+    from app.main import revise_test
+    from app.schemas import TestRevision
+    path = os.environ["DB_PATH"]
+
+    gate = {"inside": threading.Event(), "release": threading.Event()}
+    outcome = {}
+
+    def reader():
+        conn = db.get_conn()
+        # 第 1 次 SELECT * FROM cells 在复测写事务内（不挂）；挂提交后构建响应的第 2 次
+        _install_reader_gate(conn, gate, occurrence=2)
+        try:
+            outcome["cell"] = revise_test("C001", TestRevision(
+                capacity=100.5, resistance=1.9, test_version="T2"))
+        finally:
+            conn.set_trace_callback(None)
+            conn.set_progress_handler(None, 0)
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+    assert gate["inside"].wait(5)
+    _commit_confirm_then_isolate(path)
+    gate["release"].set()
+    rt.join(5)
+    assert not rt.is_alive()
+
+    cell = outcome["cell"]
+    assert cell["test_version"] == "T2"
+    _assert_coherent_cell(cell)
+

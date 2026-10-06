@@ -11,6 +11,12 @@
 
 每个请求使用各自线程的 SQLite 连接：查询只能看到已提交的完整快照，
 确认/隔离事务未提交的中间状态对其他请求不可见。
+
+同一快照口径：任何一次查询内，各电芯的占用、组编号与隔离标志必须来自**同一个
+已提交快照**。因此所有读路径都把涉及的多条 SELECT 包进同一个只读事务
+（db.read_snapshot，或直接用 LEFT JOIN 一条语句完成），杜绝"先读 cells 再读
+isolations"之间其他事务提交（确认、隔离）而拼出不存在的混合状态，例如
+occupied=false 同时 isolated=true。
 """
 from datetime import datetime, timezone
 
@@ -24,10 +30,16 @@ from .selection import choose_group
 app = FastAPI(title="退役电芯成组放行 API", version="1.1.0")
 
 
-def _row_to_cell(conn, row) -> dict:
-    iso = conn.execute(
-        "SELECT 1 FROM isolations WHERE cell_id = ?", (row["cell_id"],)
-    ).fetchone()
+# 一次取出电芯档案与隔离标志：LEFT JOIN 单条语句天然共享同一读快照，
+# occupied/group_id 与 isolated 不可能来自两个不同的已提交状态。
+CELL_SELECT = (
+    "SELECT c.cell_id, c.chemistry, c.capacity, c.resistance, c.test_version,"
+    " c.occupied, c.group_id, i.reason IS NOT NULL AS isolated"
+    " FROM cells c LEFT JOIN isolations i ON i.cell_id = c.cell_id"
+)
+
+
+def _row_to_cell(row) -> dict:
     return {
         "cell_id": row["cell_id"],
         "chemistry": row["chemistry"],
@@ -36,7 +48,7 @@ def _row_to_cell(conn, row) -> dict:
         "test_version": row["test_version"],
         "occupied": bool(row["occupied"]),
         "group_id": row["group_id"],
-        "isolated": iso is not None,
+        "isolated": bool(row["isolated"]),
     }
 
 
@@ -75,25 +87,31 @@ def create_cell(body: CellCreate):
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)).fetchone()
-    return _row_to_cell(conn, row)
+    with db.read_snapshot(conn):
+        row = conn.execute(
+            CELL_SELECT + " WHERE c.cell_id = ?", (body.cell_id,)).fetchone()
+        return _row_to_cell(row)
 
 
 @app.get("/cells")
 def list_cells():
-    """电芯列表：只反映已提交的占用与隔离状态。"""
+    """电芯列表：整批电芯的占用、组编号与隔离标志只反映同一已提交快照。"""
     conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
-    return {"count": len(rows), "cells": [_row_to_cell(conn, r) for r in rows]}
+    with db.read_snapshot(conn):
+        rows = conn.execute(CELL_SELECT + " ORDER BY c.cell_id").fetchall()
+        return {"count": len(rows), "cells": [_row_to_cell(r) for r in rows]}
 
 
 @app.get("/cells/{cell_id}")
 def get_cell(cell_id: str):
     conn = db.get_conn()
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, f"电芯 {cell_id} 不存在")
-    return _row_to_cell(conn, row)
+    # 单条 LEFT JOIN 已保证占用与隔离标志同快照；外面再包只读事务固定整次请求快照
+    with db.read_snapshot(conn):
+        row = conn.execute(
+            CELL_SELECT + " WHERE c.cell_id = ?", (cell_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, f"电芯 {cell_id} 不存在")
+        return _row_to_cell(row)
 
 
 @app.put("/cells/{cell_id}/test")
@@ -119,8 +137,10 @@ def revise_test(cell_id: str, body: TestRevision):
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    return _row_to_cell(conn, row)
+    with db.read_snapshot(conn):
+        row = conn.execute(
+            CELL_SELECT + " WHERE c.cell_id = ?", (cell_id,)).fetchone()
+        return _row_to_cell(row)
 
 
 # ---------- 安全隔离 ----------
@@ -177,57 +197,61 @@ def list_isolations():
 def preselect(body: PreselectRequest):
     """按串联要求预选一组同体系、未占用、未隔离电芯（只读，不占用）。
 
-    只统计已提交的占用与隔离状态：确认/隔离事务未提交的中间状态不可见。
+    候选的占用与隔离状态在同一个只读事务（同一已提交快照）内读取：
+    确认/隔离事务未提交的中间状态不可见，候选也不会跨快照拼装。
     """
     conn = db.get_conn()
-    rows = conn.execute(
-        "SELECT * FROM cells WHERE occupied = 0"
-        " AND cell_id NOT IN (SELECT cell_id FROM isolations)"
-    ).fetchall()
-    free = [_row_to_cell(conn, r) for r in rows]
-    if body.chemistry is not None:
-        free = [c for c in free if c["chemistry"] == body.chemistry]
+    with db.read_snapshot(conn):
+        rows = conn.execute(
+            CELL_SELECT
+            + " WHERE c.occupied = 0"
+              " AND c.cell_id NOT IN (SELECT cell_id FROM isolations)"
+        ).fetchall()
+        free = [_row_to_cell(r) for r in rows]
+        if body.chemistry is not None:
+            free = [c for c in free if c["chemistry"] == body.chemistry]
 
-    # 按化学体系分组择优
-    by_chem: dict[str, list[dict]] = {}
-    for c in free:
-        by_chem.setdefault(c["chemistry"], []).append(c)
+        # 按化学体系分组择优
+        by_chem: dict[str, list[dict]] = {}
+        for c in free:
+            by_chem.setdefault(c["chemistry"], []).append(c)
 
-    best = None  # (limited_capacity, ids_tuple, combo, chemistry)
-    for chem, cells in by_chem.items():
-        combo, limited = choose_group(
-            cells, body.series_count, body.min_capacity,
-            body.max_capacity_diff, body.max_resistance_diff,
-        )
-        if combo is None:
-            continue
-        ids = tuple(sorted(c["cell_id"] for c in combo))
-        if (best is None
-                or limited > best[0]
-                or (limited == best[0] and ids < best[1])):
-            best = (limited, ids, combo, chem)
+        best = None  # (limited_capacity, ids_tuple, combo, chemistry)
+        for chem, cells in by_chem.items():
+            combo, limited = choose_group(
+                cells, body.series_count, body.min_capacity,
+                body.max_capacity_diff, body.max_resistance_diff,
+            )
+            if combo is None:
+                continue
+            ids = tuple(sorted(c["cell_id"] for c in combo))
+            if (best is None
+                    or limited > best[0]
+                    or (limited == best[0] and ids < best[1])):
+                best = (limited, ids, combo, chem)
 
-    if best is None:
-        return JSONResponse({"feasible": False, "reason": _infeasible_reason(free, body)})
+        if best is None:
+            return JSONResponse(
+                {"feasible": False, "reason": _infeasible_reason(free, body)})
 
-    limited, ids, combo, chem = best
-    combo_sorted = sorted(combo, key=lambda c: c["cell_id"])
-    return {
-        "feasible": True,
-        "chemistry": chem,
-        "series_count": body.series_count,
-        "limited_capacity": limited,
-        "cell_ids": [c["cell_id"] for c in combo_sorted],
-        "cells": [
-            {
-                "cell_id": c["cell_id"],
-                "capacity": c["capacity"],
-                "resistance": c["resistance"],
-                "test_version": c["test_version"],
-            }
-            for c in combo_sorted
-        ],
-    }
+        limited, ids, combo, chem = best
+        combo_sorted = sorted(combo, key=lambda c: c["cell_id"])
+        return {
+            "feasible": True,
+            "chemistry": chem,
+            "series_count": body.series_count,
+            "limited_capacity": limited,
+            "cell_ids": [c["cell_id"] for c in combo_sorted],
+            "cells": [
+                {
+                    "cell_id": c["cell_id"],
+                    "capacity": c["capacity"],
+                    "resistance": c["resistance"],
+                    "test_version": c["test_version"],
+                }
+                for c in combo_sorted
+            ],
+        }
 
 
 def _infeasible_reason(free: list[dict], body: PreselectRequest) -> str:
@@ -326,7 +350,8 @@ def confirm_group(body: ConfirmRequest):
         except Exception:
             conn.rollback()  # 整组拒绝：不留下任何部分占用
             raise
-    return _group_payload(conn, group_id)
+    with db.read_snapshot(conn):
+        return _group_payload(conn, group_id)
 
 
 def _group_payload(conn, group_id: int) -> dict:
@@ -381,7 +406,9 @@ def list_groups():
 def get_group(group_id: int):
     """按组编号查询不可改写的检测快照与当前阻断状态（未提交或已回滚的组不可见）。"""
     conn = db.get_conn()
-    g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
-    if g is None:
-        raise HTTPException(404, f"组 {group_id} 不存在")
-    return _group_payload(conn, group_id)
+    with db.read_snapshot(conn):
+        g = conn.execute(
+            "SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
+        if g is None:
+            raise HTTPException(404, f"组 {group_id} 不存在")
+        return _group_payload(conn, group_id)
